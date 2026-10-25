@@ -1,0 +1,43 @@
+# Python/runtime
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+.build-venv/
+.pytest_cache/
+.mypy_cache/
+
+# Local application state and diagnostics
+*.ini
+*.log
+*.jsonl
+diagnostic-*.log
+tests/qt-*.png
+tests/*-preview/
+
+# Build output and release assets (publish these through GitHub Releases)
+build/
+.build/
+dist/
+release/
+artifacts/
+*.spec
+*.zip
+*.7z
+*.exe
+
+# IDE/OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
