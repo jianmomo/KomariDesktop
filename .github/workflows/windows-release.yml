@@ -42,6 +42,7 @@ jobs:
           python tests/self_test.py
           python tests/behavior_test.py
           python tests/performance_regression.py
+          python tests/stability_regression.py
 
       - name: Build portable package
         shell: pwsh
@@ -69,4 +70,3 @@ jobs:
             --verify-tag `
             --generate-notes `
             --title "KomariDesktop $env:GITHUB_REF_NAME"
-

@@ -1,11 +1,14 @@
 from pathlib import Path
+import json
 import sys
 import tempfile
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QSettings, Qt
+from PySide6.QtTest import QTest
 APP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
+from desktop_controls import SHORTCUT_DEFAULTS, SHORTCUT_LEGACY_DEFAULTS, normalize_shortcuts
 if (APP_ROOT / "main.py").exists():
     from main import APP_NAME, KomariClient, ProbeWindow
     import main as monitor
@@ -43,7 +46,18 @@ app = QApplication([])
 temporary = tempfile.TemporaryDirectory(prefix="komari-behavior-")
 settings_path = str(Path(temporary.name) / "settings.ini")
 monitor.QSettings = lambda *_: QSettings(settings_path, QSettings.Format.IniFormat)
+legacy_shortcuts = dict(SHORTCUT_LEGACY_DEFAULTS)
+legacy_shortcuts["edit"] = "Ctrl+Shift+Alt+F12"
+settings = QSettings(settings_path, QSettings.Format.IniFormat)
+settings.setValue("settingsVersion", 7)
+settings.setValue("shortcuts", json.dumps(legacy_shortcuts))
+settings.sync()
 window = ProbeWindow(live_enabled=False)
+assert window.shortcuts["edit"] == "Ctrl+Alt+Shift+F12"
+assert window.shortcuts["settings"] == normalize_shortcuts(SHORTCUT_DEFAULTS)["settings"]
+assert int(window.settings.value("settingsVersion")) == 8
+assert window.layer_mode == "normal"
+assert window.click_through is False
 window.show()
 window.resize(392, 520)
 for _ in range(8):
@@ -88,7 +102,7 @@ old_page = window.page_index
 window.next_page()
 assert window.page_index != old_page or window.page_count == 1
 window.clear_page_pin()
-window.resize(452, 538)
+window.resize(500, 538)
 for _ in range(8):
     app.processEvents()
 window.jump_to_page(2)
@@ -99,16 +113,53 @@ assert "固定" in window.view_label.text()
 window.clear_page_pin()
 assert not window.page_pinned
 window.toggle_editing()
+window.resize(452, 538)
+for _ in range(8):
+    app.processEvents()
+assert window.action_row.isVisible()
+assert window.carousel_spin.isVisible()
+assert all(control.isVisible() for control in (
+    window.prev_button, window.next_button, window.pin_button, window.carousel_button,
+    window.theme_button, window.opacity_down_button, window.opacity_up_button,
+    window.settings_button, window.refresh_spin, window.carousel_spin,
+))
+window._hotkey_failures = {"Ctrl+Alt+M": 1409}
+window._update_header_labels()
+assert "快捷键冲突" in window.header_hint.text()
+window._hotkey_failures = {}
+window._update_header_labels()
+assert window.carousel_spin.focusPolicy() == Qt.FocusPolicy.StrongFocus
 window.refresh_spin.setValue(30)
-window.carousel_spin.setValue(20)
+window.carousel_spin.setFocus()
+window.carousel_spin.lineEdit().selectAll()
+QTest.keyClicks(window.carousel_spin.lineEdit(), "5")
+QTest.keyClick(window.carousel_spin.lineEdit(), Qt.Key.Key_Return)
+app.processEvents()
 assert window.refresh_interval_ms == 30_000
-assert window.carousel_interval_ms == 20_000
+assert window.carousel_interval_ms == 5_000
+assert window.carousel_spin.value() == 5
 assert int(window.settings.value("refreshSeconds")) == 30
-assert int(window.settings.value("carouselSeconds")) == 20
+assert int(window.settings.value("carouselSeconds")) == 5
+window.carousel_spin.lineEdit().selectAll()
+QTest.keyClicks(window.carousel_spin.lineEdit(), "3")
+QTest.keyClick(window.carousel_spin.lineEdit(), Qt.Key.Key_Return)
+app.processEvents()
+assert window.carousel_interval_ms == 3_000
+assert window.carousel_spin.value() == 3
+assert int(window.settings.value("carouselSeconds")) == 3
 old_carousel = window.carousel_enabled
 window.carousel_button.click()
 assert window.carousel_enabled is not old_carousel
+assert window.carousel_timer.interval() == 3_000
 window.toggle_editing()
+assert window.carousel_timer.isActive()
+window.open_settings()
+app.processEvents()
+assert window._settings_dialog.carousel_spin.isEnabled()
+assert window._settings_dialog.carousel_spin.value() == 3
+assert window._settings_dialog.page_hotkeys_check.isChecked()
+window._settings_dialog.reject()
+app.processEvents()
 window.sort_mode = "cpu"
 window.group_mode = False
 cpu_values = [item["cpu"] for item in window._items() if isinstance(item["cpu"], (int, float))]
@@ -123,6 +174,9 @@ assert len(window.selected_ids) == before
 window.toggle_editing()
 app.processEvents()
 assert window.editing and window.action_row.isVisible()
+assert window.footer_label.isVisible()
+assert "T 换肤" in window.footer_label.text()
+assert "C 轮播" in window.footer_label.text()
 old_theme = window.theme
 window.cycle_theme()
 assert old_theme == "skin1" and window.theme == "skin2"
@@ -154,4 +208,3 @@ window.close()
 app.quit()
 temporary.cleanup()
 print({"layout": True, "page_count": window.page_count, "selection": True, "theme": True})
-

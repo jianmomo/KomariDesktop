@@ -32,6 +32,14 @@ from PySide6.QtWidgets import (
 
 LOGGER = logging.getLogger(__name__)
 SHORTCUT_DEFAULTS = {
+    "edit": "Ctrl+Shift+Alt+M",
+    "hide": "Ctrl+Shift+Alt+H",
+    "prev": "Ctrl+Shift+Alt+P",
+    "next": "Ctrl+Shift+Alt+N",
+    "settings": "Ctrl+Shift+Alt+S",
+    "quit": "Ctrl+Shift+Alt+Q",
+}
+SHORTCUT_LEGACY_DEFAULTS = {
     "edit": "Ctrl+Alt+M",
     "hide": "Ctrl+Alt+H",
     "prev": "Ctrl+Alt+P",
@@ -120,7 +128,7 @@ def shortcut_help(bindings=None):
         "调整模式：Esc 退出；P/N 或左右方向键翻页；滚轮翻页。",
         "调整模式：拖动空白区域移动，拖动边缘缩放；Ctrl+点击选择节点。",
         "调整模式：T 换肤，S 排序，G 分组，C 轮播，[ / ] 调透明度。",
-        "全局快捷键可能被其他程序占用，注册冲突会在应用设置时提示。",
+        "全局快捷键可能被其他程序占用；固定页 Ctrl+Alt+0–9 可在设置中关闭，注册冲突会在状态栏提示。",
     ))
     return "\n".join(lines)
 
@@ -181,7 +189,12 @@ class SettingsDialog(QDialog):
         if work:
             self.move(work.center().x() - self.width() // 2, work.center().y() - self.height() // 2)
         self._sync_page_status()
-        self._set_status(self._shortcut_load_error, error=bool(self._shortcut_load_error))
+        status = self._shortcut_load_error
+        failures = getattr(window, "_hotkey_failures", {})
+        if failures:
+            conflict = "当前快捷键冲突：" + ", ".join(sorted(failures)) + "。可修改后点击应用。"
+            status = f"{status}\n{conflict}" if status else conflict
+        self._set_status(status, error=bool(status))
 
     def _tab(self, title):
         scroll = QScrollArea(self.tabs)
@@ -218,6 +231,8 @@ class SettingsDialog(QDialog):
         except (TypeError, ValueError, OverflowError):
             spin.setValue(low)
         spin.setKeyboardTracking(False)
+        spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        spin.lineEdit().setReadOnly(False)
         spin.setSuffix(suffix)
         return spin
 
@@ -287,9 +302,8 @@ class SettingsDialog(QDialog):
         self.carousel_check = QCheckBox("自动轮播", body)
         self.carousel_check.setChecked(bool(self._snapshot.get("carousel_enabled", False)))
         form.addRow("轮播", self.carousel_check)
-        self.carousel_spin = self._spin(5, 120, self._snapshot.get("carousel_seconds", 15), body, " 秒")
-        self.carousel_spin.setEnabled(self.carousel_check.isChecked())
-        self.carousel_check.toggled.connect(self.carousel_spin.setEnabled)
+        self.carousel_spin = self._spin(3, 120, self._snapshot.get("carousel_seconds", 15), body, " 秒")
+        # 关闭自动轮播只暂停计时，不应阻止用户预先设置下次启用时的间隔。
         form.addRow("轮播间隔", self.carousel_spin)
         self.pin_check = QCheckBox("固定当前内容（暂停自动轮播）", body)
         self.pin_check.setChecked(bool(self._snapshot.get("pin_current", False)))
@@ -385,8 +399,11 @@ class SettingsDialog(QDialog):
         body, layout = self._tab("快捷键")
         layout.addWidget(self._description(
             "点击输入框后按组合键。每项只支持一个组合，主键限字母、数字或F1–F12，至少含Ctrl或Alt；"
-            "不支持Win键。Ctrl+Alt+0–9为固定页功能保留。", body,
+            "不支持Win键。Ctrl+Alt+0–9为固定页功能保留；若与其他软件冲突，可关闭下面的全局固定页快捷键。", body,
         ))
+        self.page_hotkeys_check = QCheckBox("启用全局固定页快捷键（Ctrl+Alt+0–9）", body)
+        self.page_hotkeys_check.setChecked(bool(self._snapshot.get("page_hotkeys_enabled", True)))
+        layout.addWidget(self.page_hotkeys_check)
         form = QFormLayout()
         self.shortcut_edits = {}
         for action, label in SHORTCUT_LABELS.items():
@@ -480,6 +497,7 @@ class SettingsDialog(QDialog):
             "carousel_enabled": self.carousel_check.isChecked(), "sort_mode": self.sort_combo.currentData(),
             "group_mode": self.group_check.isChecked(), "show_all_nodes": self.all_nodes_check.isChecked(),
             "selected_ids": selected, "shortcuts": shortcuts,
+            "page_hotkeys_enabled": self.page_hotkeys_check.isChecked(),
             "window_width": self.width_spin.value(), "window_height": self.height_spin.value(),
             "screen_name": self.screen_combo.currentData(), "position": self.position_combo.currentData(),
             "pin_current": self.pin_check.isChecked(),
@@ -498,10 +516,15 @@ class SettingsDialog(QDialog):
                 return False
             if result is not None and result != "":
                 raise TypeError("主程序返回了无法识别的设置应用结果")
-            self._snapshot = dict(values)
+            self._snapshot = dict(self.monitor_window.settings_snapshot())
+            actual_layer = self._snapshot.get("layer_mode")
+            layer_index = self.layer_combo.findData(actual_layer)
+            if layer_index >= 0:
+                self.layer_combo.setCurrentIndex(layer_index)
             self._sync_page_status()
             self.help_label.setText(shortcut_help(values["shortcuts"]))
-            self._set_status("设置已应用。")
+            warning = getattr(self.monitor_window, "_layer_error", "")
+            self._set_status(f"设置已应用；{warning}" if warning else "设置已应用。")
             return True
         except ValueError as error:
             self._set_status(str(error), error=True)
@@ -514,4 +537,3 @@ class SettingsDialog(QDialog):
     def _accept_preferences(self):
         if self._apply_preferences():
             self.accept()
-

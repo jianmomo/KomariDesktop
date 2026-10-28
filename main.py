@@ -1,23 +1,26 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import ctypes.wintypes as wintypes
 from datetime import date, datetime
 import json
+import logging
+import logging.handlers
 import math
 import os
-import ssl
 import sys
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
+    QCoreApplication,
     QEvent,
+    QEventLoop,
     QLockFile,
     QPoint,
     QPointF,
@@ -29,9 +32,12 @@ from PySide6.QtCore import (
     QTimer,
     QObject,
     QThread,
+    QUrl,
     Signal,
     Slot,
+    qInstallMessageHandler,
 )
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkProxy, QNetworkReply, QNetworkRequest
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -62,13 +68,21 @@ from PySide6.QtWidgets import (
 )
 # 便携嵌入式Python的._pth可能不包含脚本目录，只加入程序自身目录，避免依赖当前工作目录。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from desktop_controls import SettingsDialog, SHORTCUT_DEFAULTS, native_shortcut, normalize_shortcuts
+from desktop_controls import (
+    SHORTCUT_DEFAULTS,
+    SHORTCUT_LEGACY_DEFAULTS,
+    SettingsDialog,
+    native_shortcut,
+    normalize_shortcuts,
+)
+from desktop_surface import DesktopSurface
 
 
 APP_NAME = "KomariDesktop Qt Probe"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.3"
 WINDOW_TITLE = "KomariDesktop Qt Probe"
-KOMARI_BASE_URL = "https://vps.beihai.xyz"
+# 公共源码不携带个人服务地址；首次运行请在设置中填写自己的 Komari 地址。
+KOMARI_BASE_URL = "https://komari.example.invalid"
 KOMARI_REFRESH_MS = 15_000
 KOMARI_NODES_TTL_SECONDS = 300
 KOMARI_MAX_RETRY_MS = 300_000
@@ -77,13 +91,17 @@ HOTKEY_PREV, HOTKEY_PAGE_BASE, HOTKEY_PAGE_RESET = 0x4B05, 0x4B10, 0x4B1A
 HOTKEY_SETTINGS = 0x4B06
 WM_HOTKEY, WM_NCHITTEST, HTTRANSPARENT = 0x0312, 0x0084, -1
 WM_APP_WAKE = 0x8065
+WM_SHOWWINDOW = 0x0018
+EVENT_SYSTEM_FOREGROUND = 0x0003
+WINEVENT_SKIPOWNPROCESS = 0x0002
 MOD_ALT, MOD_CONTROL = 0x0001, 0x0002
 # v6 用 452×538 窗口承载稿件的 440×526 面板，字号统一采用逻辑像素。
-SETTINGS_VERSION = 7
+SETTINGS_VERSION = 8
 REFERENCE_CARD_HEIGHTS = {"skin1": 178, "skin2": 178, "skin3": 186,
                           "skin4": 186, "skin5": 162, "skin6": 180}
 MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS = 5, 300
-MIN_CAROUSEL_SECONDS, MAX_CAROUSEL_SECONDS = 5, 120
+MIN_CAROUSEL_SECONDS, MAX_CAROUSEL_SECONDS = 3, 120
+EDIT_HOTKEY_DEBOUNCE_SECONDS = 0.35
 SKIN_NAMES = {
     "skin1": "雾白蜡棕", "skin2": "石墨键帽", "skin3": "夜行分段",
     "skin4": "冷灰对比", "skin5": "夜行色块", "skin6": "暖沙折线",
@@ -160,6 +178,100 @@ HWND_TOP, HWND_BOTTOM = 0, 1
 HWND_TOPMOST, HWND_NOTOPMOST, GW_HWNDPREV = -1, -2, 3
 SW_RESTORE = 9
 IS_WINDOWS = sys.platform == "win32"
+INSTANCE_LOCK_FILENAME = "KomariDesktop-v1.lock"
+_LOGGER = logging.getLogger("komaridesktop")
+_LOG_CONFIGURED = False
+_SHELL_HOOK_KEEPALIVE = []
+_LOGGER.addHandler(logging.NullHandler())
+
+
+def _qt_message_handler(mode, context, message):
+    """把 Qt 警告和致命消息写入持久日志，便于定位 windowed 进程静默退出。"""
+    mode_name = getattr(mode, "name", str(mode))
+    level = logging.INFO
+    if "Debug" in mode_name:
+        level = logging.DEBUG
+    elif "Warning" in mode_name:
+        level = logging.WARNING
+    elif "Critical" in mode_name or "Fatal" in mode_name:
+        level = logging.ERROR
+    location = ""
+    file_name = getattr(context, "file", None)
+    line = getattr(context, "line", 0)
+    if file_name:
+        location = f" ({file_name}:{line})"
+    _LOGGER.log(level, "Qt消息[%s]%s: %s", mode_name, location, message)
+
+
+def _configure_logging():
+    """配置低开销滚动日志；失败时不阻断程序启动。"""
+    global _LOG_CONFIGURED
+    if _LOG_CONFIGURED:
+        return
+
+    app_root = os.path.dirname(os.path.abspath(
+        sys.executable if getattr(sys, "frozen", False) else __file__
+    ))
+    candidate_roots = [
+        os.environ.get("KOMARIDESKTOP_LOG_DIR", ""),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "KomariDesktop", "logs"),
+        os.path.join(app_root, "logs"),
+        os.path.join(tempfile.gettempdir(), "KomariDesktop", "logs"),
+    ]
+    selected_path = None
+    setup_errors = []
+    seen_roots = set()
+    for log_root in candidate_roots:
+        if not log_root or log_root in seen_roots:
+            continue
+        seen_roots.add(log_root)
+        log_path = os.path.join(log_root, "KomariDesktop.log")
+        try:
+            os.makedirs(log_root, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                log_path,
+                maxBytes=2 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+                delay=True,
+            )
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s pid=%(process)d %(name)s: %(message)s",
+                "%Y-%m-%d %H:%M:%S",
+            ))
+            for existing in tuple(_LOGGER.handlers):
+                if isinstance(existing, logging.NullHandler):
+                    _LOGGER.removeHandler(existing)
+            _LOGGER.addHandler(handler)
+            selected_path = log_path
+            break
+        except (OSError, ValueError) as exc:
+            setup_errors.append(f"{log_path}: {type(exc).__name__}: {exc}")
+
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        _LOGGER.critical("未捕获的主线程异常", exc_info=(exc_type, exc_value, exc_traceback))
+
+    sys.excepthook = handle_exception
+    if hasattr(threading, "excepthook"):
+        def handle_thread_exception(args):
+            _LOGGER.critical(
+                "未捕获的 Python 线程异常 thread=%s",
+                getattr(args.thread, "name", "unknown"),
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+        threading.excepthook = handle_thread_exception
+    qInstallMessageHandler(_qt_message_handler)
+    _LOG_CONFIGURED = True
+    if selected_path:
+        _LOGGER.info("日志已启用 path=%s argv=%r cwd=%s", selected_path, sys.argv, os.getcwd())
+    else:
+        _LOGGER.error("日志文件不可用 errors=%s", " | ".join(setup_errors))
 
 
 def normalize_komari_url(value, *, allow_insecure_http=False):
@@ -226,8 +338,23 @@ if IS_WINDOWS:
     _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     _user32.GetWindow.restype = wintypes.HWND
     _user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.IsWindowVisible.restype = wintypes.BOOL
+    _user32.IsWindowVisible.argtypes = [wintypes.HWND]
     _user32.PostMessageW.restype = wintypes.BOOL
     _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    _WinEventProc = ctypes.WINFUNCTYPE(
+        None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+        wintypes.LONG, wintypes.LONG, wintypes.DWORD, wintypes.DWORD,
+    )
+    _user32.SetWinEventHook.restype = wintypes.HANDLE
+    _user32.SetWinEventHook.argtypes = [
+        wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE, _WinEventProc,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+    ]
+    _user32.UnhookWinEvent.restype = wintypes.BOOL
+    _user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+    _user32.RegisterWindowMessageW.restype = wintypes.UINT
+    _user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 
 
 def fit_geometry(rect, available):
@@ -264,18 +391,29 @@ class HotkeyFilter(QAbstractNativeEventFilter):
                 if int(msg.hwnd or 0) != int(self.window.effectiveWinId() or 0):
                     return False, 0
                 if msg.message == WM_APP_WAKE:
-                    if self.window.hidden:
-                        self.window.toggle_hidden()
+                    self.window._show_panel(explicit=True)
+                    if self.window.editing:
+                        self.window._place_editing()
+                    else:
+                        self.window._place_desktop()
                     self.window.open_settings()
                     return True, 0
+                taskbar_message = getattr(self.window, "_taskbar_created_message", 0)
+                if taskbar_message and msg.message == taskbar_message:
+                    self.window._queue_desktop_recovery()
+                elif (msg.message == WM_SHOWWINDOW and not msg.wParam
+                      and not self.window._surface_transition and not self.window._surface_active):
+                    self.window._system_hidden = True
+                    QTimer.singleShot(0, self.window._sync_display_activity)
+                    self.window._queue_desktop_recovery()
                 if msg.message == WM_HOTKEY:
                     actions = {
-                        HOTKEY_EDIT: self.window.toggle_editing,
+                        HOTKEY_EDIT: lambda: self.window.toggle_editing(source="global-hotkey"),
                         HOTKEY_HIDE: self.window.toggle_hidden,
                         HOTKEY_PREV: lambda: self.window.next_page(-1),
                         HOTKEY_NEXT: lambda: self.window.next_page(1),
                         HOTKEY_PAGE_RESET: self.window.clear_page_pin,
-                        HOTKEY_QUIT: self.window.close,
+                        HOTKEY_QUIT: lambda: self.window.request_close("hotkey"),
                         HOTKEY_SETTINGS: self.window.open_settings,
                     }
                     for page_number in range(1, 10):
@@ -300,10 +438,13 @@ def _qcolor(value, alpha=None):
     return result
 
 
-class KomariClient:
+class KomariClient(QObject):
     """Komari 游客只读客户端；只调用公开节点和批量状态接口。"""
 
-    def __init__(self, base_url=KOMARI_BASE_URL, timeout=8, allow_insecure_http=False):
+    cancel_requested = Signal()
+
+    def __init__(self, base_url=KOMARI_BASE_URL, timeout=8, allow_insecure_http=False, parent=None):
+        super().__init__(parent)
         self.base_url = normalize_komari_url(
             base_url,
             allow_insecure_http=allow_insecure_http or "--allow-insecure-http" in sys.argv,
@@ -312,41 +453,104 @@ class KomariClient:
         self._nodes = None
         self._nodes_updated_at = 0.0
         self._cancelled = threading.Event()
-        self._opener = None
+        self._manager = None
 
     def cancel(self):
         self._cancelled.set()
+        self.cancel_requested.emit()
+
+    def _network_proxy(self):
+        # 保留原 urllib 的系统/环境代理与绕过规则，不修改系统或其他程序的代理。
+        target = urlsplit(self.base_url)
+        proxies = urllib.request.getproxies()
+        configured = proxies.get(target.scheme)
+        if not configured or urllib.request.proxy_bypass(target.hostname or ""):
+            return QNetworkProxy(QNetworkProxy.ProxyType.NoProxy)
+        proxy = urlsplit(configured if "://" in configured else f"http://{configured}")
+        if proxy.scheme != "http" or not proxy.hostname:
+            raise RuntimeError("代理配置不支持，请使用 HTTP 代理或直连")
+        try:
+            port = proxy.port or 80
+        except ValueError as error:
+            raise RuntimeError("代理端口无效") from error
+        return QNetworkProxy(QNetworkProxy.ProxyType.HttpProxy, proxy.hostname, port,
+                             unquote(proxy.username or ""), unquote(proxy.password or ""))
 
     def _request_json(self, path, payload=None):
         if self._cancelled.is_set():
             raise RuntimeError("请求已取消")
-        body = None
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "KomariDesktop/0.1 (guest-readonly)",
-        }
-        method = "GET"
+        if QCoreApplication.instance() is None or QThread.currentThread() != self.thread():
+            raise RuntimeError("网络请求必须在客户端所属的 Qt 线程中运行")
+        deadline_at = time.monotonic() + self.timeout
+        if self._manager is None:
+            manager = QNetworkAccessManager(self)
+            manager.setProxy(self._network_proxy())
+            self._manager = manager
+        request = QNetworkRequest(QUrl(f"{self.base_url}{path}"))
+        request.setRawHeader(b"Accept", b"application/json")
+        request.setRawHeader(b"User-Agent", f"KomariDesktop/{APP_VERSION} (guest-readonly)".encode("ascii"))
+        request.setAttribute(QNetworkRequest.Attribute.Http2AllowedAttribute, False)
+        request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                             QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
+        request.setMaximumRedirectsAllowed(5)
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-            method = "POST"
-        request = urllib.request.Request(
-            f"{self.base_url}{path}", headers=headers, data=body, method=method
-        )
+            request.setRawHeader(b"Content-Type", b"application/json")
+            reply = self._manager.post(request, body)
+        else:
+            reply = self._manager.get(request)
+        reply.setReadBufferSize(64 * 1024)
+        loop = QEventLoop()
+        deadline = QTimer()
+        deadline.setSingleShot(True)
+        deadline.setTimerType(Qt.TimerType.PreciseTimer)
+        raw = bytearray()
+        state = {"failure": ""}
+
+        def abort(message):
+            if not state["failure"]:
+                state["failure"] = message
+            reply.abort()
+
+        def cancelled():
+            abort("请求已取消")
+
+        def read_available():
+            if state["failure"]:
+                return
+            raw.extend(bytes(reply.read(4 * 1024 * 1024 + 1 - len(raw))))
+            if len(raw) > 4 * 1024 * 1024:
+                abort("接口响应过大")
+
+        def finished():
+            read_available()
+            loop.quit()
+
+        # Qt 的可中止异步传输同时覆盖 DNS、连接、响应头与慢速响应体；
+        # 此处事件循环运行在既有工作线程中，总时限不会被每次收到少量数据刷新。
+        reply.readyRead.connect(read_available)
+        reply.finished.connect(finished)
+        deadline.timeout.connect(lambda: abort("网络请求超时"))
+        self.cancel_requested.connect(cancelled, Qt.ConnectionType.QueuedConnection)
         try:
-            if self._opener is None:
-                context = ssl.create_default_context()
-                context.set_alpn_protocols(["http/1.1"])
-                self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
-            with self._opener.open(request, timeout=self.timeout) as response:
-                # 限制异常响应的大小，避免错误页面或损坏接口无限占用内存。
-                raw = response.read(4 * 1024 * 1024 + 1)
-                if len(raw) > 4 * 1024 * 1024:
-                    raise RuntimeError("接口响应过大")
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"HTTP {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError("网络连接失败") from exc
+            deadline.start(max(1, int((deadline_at - time.monotonic()) * 1000)))
+            if self._cancelled.is_set():
+                cancelled()
+            if not reply.isFinished():
+                loop.exec()
+            if self._cancelled.is_set():
+                raise RuntimeError("请求已取消")
+            if state["failure"]:
+                raise RuntimeError(state["failure"])
+            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            if status is not None and int(status) >= 400:
+                raise RuntimeError(f"HTTP {int(status)}")
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                raise RuntimeError(f"网络连接失败：{reply.errorString()}")
+        finally:
+            deadline.stop()
+            self.cancel_requested.disconnect(cancelled)
+            reply.deleteLater()
         try:
             data = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -386,8 +590,56 @@ class KomariClient:
             result = status_payload.get("result", {})
             if not isinstance(result, dict):
                 raise RuntimeError("实时状态格式异常")
-            statuses = result
+            statuses = self._status_entries(result)
         return self._build_samples(nodes, statuses)
+
+    @staticmethod
+    def _status_entries(result):
+        """兼容不同 Komari 版本的状态包装，但不放宽未知状态。"""
+        current = result
+        for _ in range(3):
+            if isinstance(current, dict):
+                nested = next(
+                    (current[key] for key in ("data", "nodes", "statuses")
+                     if isinstance(current.get(key), dict)),
+                    None,
+                )
+                if nested is None:
+                    return current
+                current = nested
+                continue
+            return {}
+        return current if isinstance(current, dict) else {}
+
+    @staticmethod
+    def _status_for_node(statuses, node_id):
+        if not isinstance(statuses, dict):
+            return {}
+        status = statuses.get(node_id)
+        if isinstance(status, dict):
+            return status
+        for key, candidate in statuses.items():
+            if str(key).strip() == node_id and isinstance(candidate, dict):
+                return candidate
+        return {}
+
+    @staticmethod
+    def _normalize_online(value):
+        """只把明确的在线/离线值转换为状态，未知值继续保持过期。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"true", "1", "online", "up", "on"}:
+                return True
+            if normalized in {"false", "0", "offline", "down", "off"}:
+                return False
+        return None
 
     @staticmethod
     def _number(value):
@@ -440,10 +692,11 @@ class KomariClient:
             node_id = cls._safe_text(node["uuid"], "", 128)
             if not node_id:
                 continue
-            status = statuses.get(node_id, {}) if isinstance(statuses, dict) else {}
-            if not isinstance(status, dict):
-                status = {}
-            online = status.get("online")
+            status = cls._status_for_node(statuses, node_id)
+            online_raw = status.get("online")
+            if online_raw is None:
+                online_raw = status.get("status")
+            online = cls._normalize_online(online_raw)
             status_key = "online" if online is True else "offline" if online is False else "stale"
 
             ram_used = cls._number(status.get("ram"))
@@ -483,9 +736,15 @@ class KomariClient:
                 entry = None
                 for task_id in task_ids:
                     candidate = pings.get(str(task_id), pings.get(task_id))
-                    if isinstance(candidate, dict) and cls._number(candidate.get("latest")) is not None:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_loss = cls._number(candidate.get("loss"))
+                    if (cls._number(candidate.get("latest")) is not None
+                            or (candidate_loss is not None and candidate_loss > 0)):
                         entry = candidate
                         break
+                    if entry is None and candidate_loss is not None:
+                        entry = candidate
                 if entry is not None:
                     # 保留接口精度给趋势图，整数化只在文字展示时进行。
                     latency[carrier] = cls._number(entry.get("latest"))
@@ -527,16 +786,20 @@ class LiveRefreshWorker(QObject):
     def __init__(self, base_url, parent=None):
         super().__init__(parent)
         self.base_url = base_url
-        self.client = KomariClient(base_url)
+        self.client = KomariClient(base_url, parent=self)
 
     @Slot()
     def run(self):
+        _LOGGER.info("实时刷新开始")
         try:
             samples = self.client.fetch_samples()
+            _LOGGER.info("实时刷新成功 samples=%d", len(samples))
             self.succeeded.emit(samples, datetime.now().strftime("%H:%M:%S"))
         except Exception as exc:
+            _LOGGER.warning("实时刷新失败 type=%s message=%s", type(exc).__name__, str(exc)[:160])
             self.failed.emit(f"{type(exc).__name__}: {exc}")
         finally:
+            _LOGGER.info("实时刷新线程任务结束")
             self.finished.emit()
 
 
@@ -2510,6 +2773,8 @@ class NodeCard(SurfaceFrame):
 class ProbeWindow(QWidget):
     MIN_WIDTH, MIN_HEIGHT = 320, 300
     refresh_requested = Signal()
+    shell_foreground_changed = Signal(object)
+    shutdown_ready = Signal()
 
     def __init__(self, live_enabled=None):
         super().__init__(None)
@@ -2530,11 +2795,24 @@ class ProbeWindow(QWidget):
         self._migrate_settings()
         self.editing = False
         self.locked = True
+        self._edit_transition = False
+        self._last_edit_hotkey_at = 0.0
         self.hidden = False
-        self.layer_mode = str(self.settings.value("layerMode", "desktop"))
+        self._system_hidden = False
+        self._desktop_surface = None
+        self._surface_active = False
+        self._surface_transition = False
+        self._display_suspended = True
+        self._preferences_applying = False
+        self._preferences_rolling_back = False
+        self._shell_hook = None
+        self._shell_event_callback = None
+        self._taskbar_created_message = 0
+        # 首次启动优先保证用户能看到面板；已有配置仍保留原图层选择。
+        self.layer_mode = str(self.settings.value("layerMode", "normal"))
         if self.layer_mode not in {"desktop", "normal", "topmost"}:
             self.layer_mode = "normal"
-        self.click_through = self._bool_value("clickThrough", True)
+        self.click_through = self._bool_value("clickThrough", False)
         self.layout_mode = str(self.settings.value("layoutMode", "auto"))
         if self.layout_mode not in {"auto", "single"}:
             self.layout_mode = "auto"
@@ -2549,6 +2827,8 @@ class ProbeWindow(QWidget):
             self.shortcuts = normalize_shortcuts(json.loads(str(self.settings.value("shortcuts", "{}"))))
         except (ValueError, TypeError, json.JSONDecodeError):
             self.shortcuts = dict(SHORTCUT_DEFAULTS)
+        # 固定页快捷键数量较多，允许用户单独关闭，避免长期占用其他软件的数字组合键。
+        self.page_hotkeys_enabled = self._bool_value("pageHotkeysEnabled", True)
         # 参考稿接近不透明；桌面叠加仍可在调整模式中降低透明度。
         self.opacity_percent = self._number(self.settings.value("windowOpacity", 100), 40, 100, 100)
         self.live_enabled = ("--demo" not in sys.argv) if live_enabled is None else bool(live_enabled)
@@ -2562,6 +2842,7 @@ class ProbeWindow(QWidget):
         self._live_worker = None
         self._live_busy = False
         self._close_requested = False
+        self._close_reason = ""
         self._initial_show_done = False
         self._retry_failures = 0
         self.refresh_interval_ms = self._number(
@@ -2616,6 +2897,7 @@ class ProbeWindow(QWidget):
         self._card_skin = None
         self._hotkey_registered = set()
         self._hotkey_failures = {}
+        self._layer_error = ""
         self.drag_origin = self.drag_geometry = None
         self.resize_origin = self.resize_geometry = None
         self.resize_edge = None
@@ -2637,6 +2919,16 @@ class ProbeWindow(QWidget):
         self.carousel_timer = QTimer(self)
         self.carousel_timer.setInterval(15_000)
         self.carousel_timer.timeout.connect(self._advance_carousel)
+        self._desktop_recovery_timer = QTimer(self)
+        self._desktop_recovery_timer.setSingleShot(True)
+        self._desktop_recovery_timer.setInterval(80)
+        self._desktop_recovery_timer.timeout.connect(self._recover_desktop_window)
+        self._surface_render_timer = QTimer(self)
+        self._surface_render_timer.setSingleShot(True)
+        self._surface_render_timer.setInterval(80)
+        self._surface_render_timer.timeout.connect(self._refresh_desktop_surface)
+        self.shell_foreground_changed.connect(self._on_shell_foreground,
+                                              Qt.ConnectionType.QueuedConnection)
         self._sync_carousel_timer()
         self.native_filter = HotkeyFilter(self)
         QApplication.instance().installNativeEventFilter(self.native_filter)
@@ -2657,6 +2949,22 @@ class ProbeWindow(QWidget):
         except (TypeError, ValueError):
             version = 0
         self._geometry_reference_migration = version < SETTINGS_VERSION
+        if version < 8:
+            # 仅迁移仍等于旧默认值的项目；用户已经自定义过的组合保持不变。
+            raw_shortcuts = self.settings.value("shortcuts", "")
+            try:
+                stored_shortcuts = json.loads(raw_shortcuts) if isinstance(raw_shortcuts, str) else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                stored_shortcuts = {}
+            if isinstance(stored_shortcuts, dict):
+                migrated = False
+                for action, legacy in SHORTCUT_LEGACY_DEFAULTS.items():
+                    if stored_shortcuts.get(action) == legacy:
+                        stored_shortcuts[action] = SHORTCUT_DEFAULTS[action]
+                        migrated = True
+                if migrated:
+                    self.settings.setValue("shortcuts", json.dumps(stored_shortcuts, ensure_ascii=False))
+                    _LOGGER.info("已迁移仍使用旧默认值的快捷键到低冲突组合")
         if version < 4 and str(self.settings.value("sortMode", "")) in {"", "name"}:
             # 旧版本默认按名称，而六款设计稿的底部说明统一按 CPU；
             # 用户仍可在调整模式中切回其它排序。
@@ -2751,6 +3059,7 @@ class ProbeWindow(QWidget):
             return
         self.timer.stop()
         if self._live_thread is None:
+            _LOGGER.info("创建实时刷新 QThread")
             thread = QThread(self)
             worker = LiveRefreshWorker(self.komari_url)
             worker.moveToThread(thread)
@@ -2764,27 +3073,35 @@ class ProbeWindow(QWidget):
             self._live_thread = thread
             self._live_worker = worker
             thread.start()
+            _LOGGER.info("实时刷新 QThread 已启动")
         self._live_busy = True
         self.refresh_requested.emit()
 
     @Slot()
     def _on_live_refresh_finished(self):
         self._live_busy = False
+        _LOGGER.info(
+            "实时刷新完成 close_requested=%s hidden=%s next_refresh_ms=%s",
+            self._close_requested,
+            self.hidden,
+            self._next_refresh_ms,
+        )
         if self._close_requested:
             if self._live_thread:
                 self._live_thread.quit()
             return
         if self.live_enabled:
-            self.timer.start(max(60_000, self._next_refresh_ms) if self.hidden else self._next_refresh_ms)
+            self.timer.start(self._poll_interval())
 
     @Slot()
     def _on_live_thread_finished(self):
+        _LOGGER.info("实时刷新 QThread 已结束 close_requested=%s", self._close_requested)
         self._live_thread = None
         # 保留 Python 包装对象至窗口释放；原生 worker 由 thread.finished/deleteLater
         # 在所属线程销毁，不能同时从主线程丢弃最后一个 Python 引用。
         self._live_busy = False
         if self._close_requested:
-            QTimer.singleShot(0, self.close)
+            QTimer.singleShot(0, lambda: self.request_close("refresh-thread-finished"))
 
     @Slot(object, str)
     def _on_live_success(self, samples, updated_at):
@@ -2801,6 +3118,13 @@ class ProbeWindow(QWidget):
         self._next_refresh_ms = self.refresh_interval_ms
         self.last_update_text = updated_at or "刚刚"
         self._last_live_success_at = time.monotonic()
+        online_count = sum(item.get("status") == "online" for item in samples)
+        offline_count = sum(item.get("status") == "offline" for item in samples)
+        stale_count = sum(item.get("status") == "stale" for item in samples)
+        _LOGGER.info(
+            "实时状态分类 samples=%d online=%d offline=%d stale=%d",
+            len(samples), online_count, offline_count, stale_count,
+        )
         available = {str(item.get("id")) for item in samples if item.get("id")}
         if self.show_all_nodes:
             self.selected_ids = set(available)
@@ -2808,7 +3132,7 @@ class ProbeWindow(QWidget):
             self.page_index = self._pending_page_index
             self._page_anchor = self._pending_page_anchor
             self._restore_page_pending = False
-        if self.hidden:
+        if self._display_paused():
             self._view_dirty = True
         else:
             self._refresh_cards()
@@ -2853,7 +3177,7 @@ class ProbeWindow(QWidget):
                 item["status"] = "stale"
             if self._retry_failures == 1:
                 self._record_latency_history(self.samples)
-            if self.hidden:
+            if self._display_paused():
                 self._view_dirty = True
             else:
                 self._refresh_cards(force=False)
@@ -2861,17 +3185,37 @@ class ProbeWindow(QWidget):
             self._update_header_labels()
             self._refresh_visual_size()
 
+    def _display_paused(self):
+        if self.hidden or self.isMinimized():
+            return True
+        # 桌面后层会故意隐藏 Qt 控制窗口，但 DesktopSurface 仍是用户可见的
+        # 面板。此时不能把“控制窗口不可见”误判成“显示已暂停”，否则刷新只
+        # 更新内存数据，桌面上的位图会一直停留在旧的“数据过期”状态。
+        if self._surface_active and self.layer_mode == "desktop":
+            return False
+        if self._system_hidden:
+            return True
+        return not self.isVisible()
+
+    def _poll_interval(self):
+        return max(60_000, self._next_refresh_ms) if self._display_paused() else self._next_refresh_ms
+
+    def _carousel_should_run(self):
+        return (self.carousel_enabled and not self.page_pinned and not self.editing
+                and not self._display_paused() and self._settings_dialog is None
+                and not self._close_requested)
+
     def _sync_carousel_timer(self):
-        self.carousel_timer.setInterval(self.carousel_interval_ms)
-        if (self.carousel_enabled and not self.page_pinned
-                and not self.editing and not self.hidden and self._settings_dialog is None
-                and not self._close_requested):
-            self.carousel_timer.start()
+        if self.carousel_timer.interval() != self.carousel_interval_ms:
+            self.carousel_timer.setInterval(self.carousel_interval_ms)
+        if self._carousel_should_run():
+            if not self.carousel_timer.isActive():
+                self.carousel_timer.start()
         else:
             self.carousel_timer.stop()
 
     def _advance_carousel(self):
-        if self.page_count > 1 and not self.page_pinned and not self.editing and not self.hidden:
+        if self.page_count > 1 and self._carousel_should_run():
             self.next_page()
 
     @staticmethod
@@ -3025,7 +3369,9 @@ class ProbeWindow(QWidget):
             spin.setToolTip(tooltip)
             spin.setKeyboardTracking(False)
             spin.setFixedSize(52, 24)
-            spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            # 调整模式下数字框需要允许直接输入；NoFocus 会导致鼠标点击后无法编辑。
+            spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            spin.lineEdit().setReadOnly(False)
             spin.setProperty("interactive_control", True)
         self.theme_button = ActionButton("T", "切换主题", self.action_row)
         self.opacity_down_button = ActionButton("−", "降低透明度", self.action_row)
@@ -3108,6 +3454,7 @@ class ProbeWindow(QWidget):
             "carousel_seconds": self.carousel_interval_ms // 1000, "carousel_enabled": self.carousel_enabled,
             "sort_mode": self.sort_mode, "group_mode": self.group_mode, "show_all_nodes": self.show_all_nodes,
             "selected_ids": sorted(self.selected_ids), "shortcuts": dict(self.shortcuts),
+            "page_hotkeys_enabled": self.page_hotkeys_enabled,
             "window_width": self.width(), "window_height": self.height(),
             "screen_name": self.screen().name() if self.screen() else "", "position": "keep",
             "pin_current": self.page_pinned, "page_count": self.page_count,
@@ -3115,6 +3462,56 @@ class ProbeWindow(QWidget):
         }
 
     def apply_preferences(self, values):
+        """设置失败时回滚内存和窗口；事务期间禁止间接保存草稿。"""
+        fields = (
+            "shortcuts", "selected_ids", "show_all_nodes", "click_through", "layer_mode",
+            "layout_mode", "max_per_page", "opacity_percent", "theme", "sort_mode", "group_mode",
+            "carousel_enabled", "refresh_interval_ms", "carousel_interval_ms", "_next_refresh_ms",
+            "pinned_node_ids", "page_pinned", "page_index", "_page_anchor", "_restore_page_pending",
+            "page_hotkeys_enabled",
+        )
+        previous = {key: copy.deepcopy(getattr(self, key)) for key in fields}
+        geometry = QRect(self.geometry())
+        self._preferences_applying = True
+        try:
+            error = self._apply_preferences(values)
+            if error:
+                if self.geometry() != geometry or any(getattr(self, key) != value for key, value in previous.items()):
+                    self._restore_preferences(previous, geometry)
+                return error
+        except (ValueError, TypeError, RuntimeError, OSError):
+            _LOGGER.exception("设置应用异常，恢复原有偏好")
+            self._restore_preferences(previous, geometry)
+            raise
+        finally:
+            self._preferences_applying = False
+        self._save_settings()
+        return None
+
+    def _restore_preferences(self, previous, geometry):
+        shortcuts_changed = self.shortcuts != previous["shortcuts"]
+        page_hotkeys_changed = self.page_hotkeys_enabled != previous["page_hotkeys_enabled"]
+        if shortcuts_changed or page_hotkeys_changed:
+            self._unregister_hotkeys()
+        for key, value in previous.items():
+            setattr(self, key, value)
+        if (shortcuts_changed or page_hotkeys_changed) and self._initial_show_done:
+            self._register_hotkeys()
+        self.setGeometry(geometry)
+        self._apply_theme()
+        self._refresh_cards(force=True)
+        self._set_locked(self.locked)
+        self._preferences_rolling_back = True
+        try:
+            if not self.editing and not self._place_desktop():
+                _LOGGER.error("设置回滚后原图层恢复失败：%s", self._layer_error)
+        finally:
+            self._preferences_rolling_back = False
+        self._sync_carousel_timer()
+        if self.live_enabled and not self._live_busy:
+            self.timer.start(self._poll_interval())
+
+    def _apply_preferences(self, values):
         """全部校验后才应用；快捷键注册失败恢复原组合，禁止半保存草稿。"""
         preferences = self.settings_snapshot()
         preferences.update(values)
@@ -3127,11 +3524,12 @@ class ProbeWindow(QWidget):
                 if preferences[key] not in choices:
                     raise ValueError(f"{key} 设置值无效")
             for key, low, high in (("opacity", 40, 100), ("max_per_page", 0, 100),
-                                   ("refresh_seconds", 5, 300), ("carousel_seconds", 5, 120),
+                                   ("refresh_seconds", 5, 300), ("carousel_seconds", 3, 120),
                                    ("window_width", 320, 32768), ("window_height", 300, 32768)):
                 if type(preferences[key]) is not int or not low <= preferences[key] <= high:
                     raise ValueError(f"{key} 必须在 {low}–{high} 范围内")
-            for key in ("click_through", "carousel_enabled", "group_mode", "show_all_nodes", "pin_current"):
+            for key in ("click_through", "carousel_enabled", "group_mode", "show_all_nodes",
+                        "pin_current", "page_hotkeys_enabled"):
                 if type(preferences[key]) is not bool:
                     raise ValueError(f"{key} 必须为开关值")
             selected = preferences["selected_ids"]
@@ -3145,18 +3543,24 @@ class ProbeWindow(QWidget):
                 raise ValueError("目标显示器已断开，请重新选择")
         except (ValueError, TypeError, KeyError) as error:
             return str(error)
-        if shortcuts != self.shortcuts and self._initial_show_done:
+        page_hotkeys_enabled = preferences["page_hotkeys_enabled"]
+        page_hotkeys_changed = page_hotkeys_enabled != self.page_hotkeys_enabled
+        if (shortcuts != self.shortcuts or page_hotkeys_changed) and self._initial_show_done:
             previous = self.shortcuts
+            previous_page_hotkeys = self.page_hotkeys_enabled
             self._unregister_hotkeys()
             self.shortcuts = shortcuts
+            self.page_hotkeys_enabled = page_hotkeys_enabled
             self._register_hotkeys()
             if self._hotkey_failures:
                 failed = ", ".join(self._hotkey_failures)
                 self._unregister_hotkeys()
                 self.shortcuts = previous
+                self.page_hotkeys_enabled = previous_page_hotkeys
                 self._register_hotkeys()
                 return f"快捷键被占用：{failed}。已恢复原快捷键，本次设置未保存。"
         self.shortcuts = shortcuts
+        self.page_hotkeys_enabled = page_hotkeys_enabled
         selection_changed = self.selected_ids != set(selected) or self.show_all_nodes != preferences["show_all_nodes"]
         self.selected_ids = set(selected)
         self.show_all_nodes = preferences["show_all_nodes"]
@@ -3199,14 +3603,16 @@ class ProbeWindow(QWidget):
             self.toggle_page_pin()
         self._set_locked(self.locked)
         if not self.editing and not self._place_desktop():
-            return getattr(self, "_layer_error", "图层应用失败")
+            return self._layer_error or "图层应用失败"
         self._sync_carousel_timer()
         if self.live_enabled and not self._live_busy:
-            self.timer.start(max(60_000, self._next_refresh_ms) if self.hidden else self._next_refresh_ms)
+            self.timer.start(self._poll_interval())
         self._save_settings()
         return None
 
     def open_settings(self):
+        if self._surface_active:
+            self._disable_desktop_surface(restore_window=True)
         if self._settings_dialog is None:
             self._settings_dialog = SettingsDialog(self)
             self._settings_dialog.finished.connect(self._settings_closed)
@@ -3220,6 +3626,8 @@ class ProbeWindow(QWidget):
         if dialog is not None:
             dialog.deleteLater()
         self._sync_carousel_timer()
+        if not self.editing and not self.hidden and not self._close_requested:
+            QTimer.singleShot(0, self._place_desktop)
 
     def _create_tray(self):
         if self.tray is not None or not QSystemTrayIcon.isSystemTrayAvailable():
@@ -3257,11 +3665,11 @@ class ProbeWindow(QWidget):
         action("立即刷新", self._request_live_refresh).setEnabled(self.live_enabled and not self._live_busy)
         action("找回面板到当前屏幕", self.recover_to_screen)
         menu.addSeparator()
-        action("退出", self.close)
+        action("退出", lambda: self.request_close("tray"))
 
     def recover_to_screen(self):
-        if self.hidden:
-            self.toggle_hidden()
+        if not self._show_panel(explicit=True):
+            return
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen:
             work = screen.availableGeometry()
@@ -3557,6 +3965,7 @@ class ProbeWindow(QWidget):
         # 换肤/调透明度不擅自恢复大尺寸；过矮时由摘要与滚动兜底。
 
     def _update_header_labels(self):
+        self._queue_surface_render()
         online = sum(x["status"] == "online" for x in self.samples)
         offline = sum(x["status"] == "offline" for x in self.samples)
         stale = sum(x["status"] == "stale" for x in self.samples)
@@ -3604,7 +4013,7 @@ class ProbeWindow(QWidget):
             )
         else:
             self.mode_label.setToolTip(f"上次更新：{self.last_update_text}")
-        self.header_hint.setText("Esc 退出调整" if self.editing else f"{self.shortcuts['edit']} 调整")
+        hotkey_warning = ""
         if self._hotkey_failures:
             failed_keys = ", ".join(sorted(self._hotkey_failures))
             self.header_hint.setToolTip(f"快捷键未注册（可能被其他程序占用）：{failed_keys}")
@@ -3612,7 +4021,9 @@ class ProbeWindow(QWidget):
         else:
             self.header_hint.setToolTip(f"{self.shortcuts['prev']} / {self.shortcuts['next']} 翻页；"
                                        f"{self.shortcuts['settings']} 设置；Ctrl+Alt+1–9 固定节点；Ctrl+Alt+0 取消固定")
-            hotkey_warning = ""
+        if not self.page_hotkeys_enabled:
+            hotkey_warning += " · 固定页全局快捷键已关闭"
+        self.header_hint.setText(("Esc 退出调整" if self.editing else f"{self.shortcuts['edit']} 调整") + hotkey_warning)
         shown_total = len(self._items())
         if shown_total and self._page_ranges:
             start_index, end_index = self._page_ranges[min(self.page_index, len(self._page_ranges) - 1)]
@@ -3651,7 +4062,7 @@ class ProbeWindow(QWidget):
                 spin.blockSignals(False)
         narrow_toolbar = self.width() < 360
         self.refresh_spin.setVisible(not narrow_toolbar and self.editing)
-        self.carousel_spin.setVisible(self.width() >= 500 and self.editing)
+        self.carousel_spin.setVisible(self.width() >= 440 and self.editing)
         if self.width() < 360:
             self.toolbar_hint.setText("P/N 翻页 · 1–9 固定 · 0 取消" + hotkey_warning)
         elif self.width() < 500:
@@ -3687,8 +4098,17 @@ class ProbeWindow(QWidget):
                     self.footer_page_label.setText(f"{start}–{end}/{shown_total}")
             self.footer_label.setTextFormat(Qt.TextFormat.RichText)
         else:
-            footer = ("调整中 · 拖动/拉伸 · F2 设置" if self.width() < 500 else
-                      f"调整中 · Ctrl+点击选节点 · P/N 翻页 · F2 设置 · 背景 {self.opacity_percent}%")
+            if self.width() < 500:
+                footer = "调整中 · T 换肤 · C 轮播 · P/N 翻页 · F2 设置"
+            else:
+                footer = (
+                    f"调整中 · T 换肤 · C 轮播 · S 排序 · G 分组 · [ ] 透明度 · "
+                    f"P/N 翻页 · F2 设置 · 背景 {self.opacity_percent}%"
+                )
+            self.footer_label.setToolTip(
+                "编辑模式快捷键：T 换肤；C 开关轮播；S 切换排序；G 切换分组；"
+                "[ / ] 调整透明度；P / N 翻页；1–9 固定页面；0 取消固定；F2 设置。"
+            )
             self.footer_label.setTextFormat(Qt.TextFormat.PlainText)
         self.footer_label.setText(footer)
         if not self.editing and self.footer_page_label.isVisible():
@@ -3704,9 +4124,7 @@ class ProbeWindow(QWidget):
                 page_variants[-1],
             ))
         if hasattr(self, "carousel_timer"):
-            should_run = (self.carousel_enabled and not self.page_pinned
-                          and not self.hidden and not self.editing and self._settings_dialog is None
-                          and not self._close_requested)
+            should_run = self._carousel_should_run()
             if self.carousel_timer.isActive() != should_run:
                 self._sync_carousel_timer()
 
@@ -3842,6 +4260,7 @@ class ProbeWindow(QWidget):
         return sorted(items, key=(lambda item: (item["region"], key(item))) if self.group_mode else key)
 
     def _refresh_cards(self, force=False):
+        self._queue_surface_render()
         items = self._items()
         mode, _, total = self._layout(items)
         page_start, page_end = self._page_ranges[min(self.page_index, self.page_count - 1)]
@@ -3982,15 +4401,15 @@ class ProbeWindow(QWidget):
         self.header_hint.setVisible(self.width() >= 380 or self.editing)
         narrow = self.width() < 360
         compact = mode != "wide"
-        self.theme_button.setVisible(not narrow)
+        self.theme_button.setVisible(self.editing or not narrow)
         self.settings_button.setVisible(True)
-        self.view_label.setVisible(self.width() >= 700)
-        self.page_label.setVisible(self.width() >= 500)
-        self.opacity_down_button.setVisible(not compact)
-        self.opacity_up_button.setVisible(not compact)
+        self.view_label.setVisible(self.width() >= 700 and not self.editing)
+        self.page_label.setVisible(self.width() >= 500 and not self.editing)
+        self.opacity_down_button.setVisible(self.editing or not compact)
+        self.opacity_up_button.setVisible(self.editing or not compact)
         if hasattr(self, "refresh_spin"):
             self.refresh_spin.setVisible(not narrow and self.editing)
-            self.carousel_spin.setVisible(self.width() >= 500 and self.editing)
+            self.carousel_spin.setVisible(self.width() >= 440 and self.editing)
         left, top, right, bottom = tuple(spec.get("panel_margins", (16, 14, 16, 12)))
         if mode == "narrow":
             left = right = max(11, left - 4)
@@ -3999,44 +4418,86 @@ class ProbeWindow(QWidget):
         self.panel_layout.setContentsMargins(left, top, right, bottom)
 
     def _queue_refresh(self):
-        if self._refresh_scheduled:
+        if self._refresh_scheduled or self._close_requested:
             return
         self._refresh_scheduled = True
 
         def refresh():
             self._refresh_scheduled = False
+            if self._close_requested:
+                return
+            if self._display_paused():
+                self._view_dirty = True
+                return
             self._refresh_cards(force=True)
 
         QTimer.singleShot(0, refresh)
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._system_hidden = False
         if not self._initial_show_done:
             self._initial_show_done = True
             self._restore_geometry()
             QTimer.singleShot(0, self._after_show)
+        self._sync_display_activity()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        # 桌面图像层与 Qt 控制窗口切换时会主动重新映射窗口，
+        # 这不是用户隐藏或系统最小化，不应暂停刷新或触发恢复流程。
+        if self._surface_transition:
+            return
+        self._system_hidden = not self.hidden and not self._close_requested
+        self._sync_display_activity()
+        self._queue_desktop_recovery()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "timer"):
+            self._sync_display_activity()
+            if self.isMinimized():
+                self._queue_desktop_recovery()
 
     def _after_show(self):
         self._register_hotkeys()
         self._create_tray()
         self._watch_screens()
+        self._install_shell_hook()
         self._set_locked(True)
-        self._place_desktop()
+        placed = self._place_desktop()
+        _LOGGER.info("面板初始化完成 mode=%s placed=%s", self.layer_mode, placed)
         self._queue_refresh()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._queue_refresh()
+        self._queue_surface_render()
 
     def closeEvent(self, event):
+        if not self._close_reason:
+            self._close_reason = "external"
+        thread_running = bool(self._live_thread and self._live_thread.isRunning())
+        _LOGGER.info(
+            "收到 closeEvent reason=%s close_requested=%s thread_running=%s hidden=%s",
+            self._close_reason,
+            self._close_requested,
+            thread_running,
+            self.hidden,
+        )
         self._close_requested = True
+        self._disable_desktop_surface(restore_window=False)
+        self._surface_render_timer.stop()
+        self._desktop_recovery_timer.stop()
+        self._remove_shell_hook()
         if hasattr(self, "timer"):
             self.timer.stop()
         self.carousel_timer.stop()
-        if self._live_thread and self._live_thread.isRunning():
+        if thread_running:
             # 网络请求在工作线程中执行，不能在窗口析构时直接销毁 QThread。
             # 先隐藏窗口并等待线程自然结束，避免退出时出现
             # ``QThread: Destroyed while thread is still running``。
+            _LOGGER.info("关闭时请求实时刷新线程停止")
             self._live_worker.client.cancel()
             self._live_thread.quit()
             event.ignore()
@@ -4049,19 +4510,31 @@ class ProbeWindow(QWidget):
             self._settings_dialog.close()
         self._save_settings()
         QApplication.instance().removeNativeEventFilter(self.native_filter)
+        _LOGGER.info("closeEvent 接受，窗口清理完成")
         super().closeEvent(event)
+        if event.isAccepted():
+            # Qt::Tool 不计入“最后一个主窗口”，不能仅依靠 quitOnLastWindowClosed。
+            self.shutdown_ready.emit()
 
     def _shutdown_live_thread(self):
+        _LOGGER.info("QApplication.aboutToQuit close_reason=%s", self._close_reason or "unknown")
         self._close_requested = True
         self.timer.stop()
         self.carousel_timer.stop()
+        self._desktop_recovery_timer.stop()
+        self._remove_shell_hook()
         if self._live_thread and self._live_thread.isRunning():
+            _LOGGER.info("aboutToQuit 等待实时刷新线程结束")
             self._live_worker.client.cancel()
             self._live_thread.quit()
             # 常规退出在 closeEvent 异步等待；外部 app.quit 也须完成工作线程收尾。
-            self._live_thread.wait((self._live_worker.client.timeout * 2 + 1) * 1000)
+            timeout_ms = (self._live_worker.client.timeout * 2 + 1) * 1000
+            if not self._live_thread.wait(timeout_ms):
+                _LOGGER.error("实时刷新线程未在 %dms 内结束", timeout_ms)
 
     def _save_settings(self):
+        if self._preferences_applying:
+            return
         self.settings.setValue("settingsVersion", SETTINGS_VERSION)
         self.settings.setValue("geometry", self.geometry())
         self.settings.setValue("windowOpacity", self.opacity_percent)
@@ -4082,6 +4555,7 @@ class ProbeWindow(QWidget):
         self.settings.setValue("layoutMode", self.layout_mode)
         self.settings.setValue("maxPerPage", self.max_per_page)
         self.settings.setValue("shortcuts", json.dumps(self.shortcuts, ensure_ascii=False))
+        self.settings.setValue("pageHotkeysEnabled", self.page_hotkeys_enabled)
         self.settings.setValue("selectedIds", json.dumps(sorted(self.selected_ids), ensure_ascii=False))
         self.settings.sync()
 
@@ -4140,14 +4614,18 @@ class ProbeWindow(QWidget):
             (HOTKEY_QUIT, self.shortcuts["quit"]),
             (HOTKEY_PAGE_RESET, "Ctrl+Alt+0"),
         ]
-        hotkeys.extend((HOTKEY_PAGE_BASE + page_number - 1, f"Ctrl+Alt+{page_number}") for page_number in range(1, 10))
+        if self.page_hotkeys_enabled:
+            hotkeys.extend((HOTKEY_PAGE_BASE + page_number - 1, f"Ctrl+Alt+{page_number}")
+                            for page_number in range(1, 10))
         for hotkey_id, key in hotkeys:
             _user32.UnregisterHotKey(hwnd, hotkey_id)
             modifiers, virtual_key = native_shortcut(key)
             if _user32.RegisterHotKey(hwnd, hotkey_id, modifiers | 0x4000, virtual_key):
                 self._hotkey_registered.add(hotkey_id)
             else:
-                self._hotkey_failures[key] = ctypes.get_last_error()
+                error_code = ctypes.get_last_error()
+                self._hotkey_failures[key] = error_code
+                _LOGGER.warning("全局快捷键注册失败 key=%s id=%d winerror=%d", key, hotkey_id, error_code)
         if hasattr(self, "header_hint"):
             self._update_header_labels()
 
@@ -4204,41 +4682,178 @@ class ProbeWindow(QWidget):
         self._update_header_labels()
         self.update()
 
-    def toggle_editing(self):
-        if self.hidden:
-            self.toggle_hidden()
-        if self.locked:
-            self._set_locked(False)
-            self._place_editing()
-            self._install_mouse_filters()
-        else:
-            self._save_settings()
-            self.releaseMouse()
-            self._set_locked(True)
-            self._place_desktop()
+    def toggle_editing(self, source="direct"):
+        """切换调整模式；全局快捷键需要防止重复 WM_HOTKEY 造成双切换。"""
+        now = time.monotonic()
+        if source == "global-hotkey":
+            if now - self._last_edit_hotkey_at < EDIT_HOTKEY_DEBOUNCE_SECONDS:
+                _LOGGER.info("忽略重复调整快捷键 elapsed_ms=%d", round(
+                    max(0.0, now - self._last_edit_hotkey_at) * 1000
+                ))
+                return False
+            self._last_edit_hotkey_at = now
+        if self._edit_transition:
+            _LOGGER.info("忽略调整模式重入 source=%s", source)
+            return False
+        self._edit_transition = True
+        try:
+            if self.hidden or self.isMinimized() or self._system_hidden:
+                if not self._show_panel(explicit=True):
+                    return False
+            if self.locked:
+                self._disable_desktop_surface(restore_window=True)
+                # 桌面后层通过 Win32 隐藏控制窗口；进入调整模式后明确恢复
+                # “系统隐藏”状态，避免刷新逻辑继续把可见的 Qt 窗口当成暂停。
+                self._system_hidden = False
+                self._set_locked(False)
+                self._place_editing()
+                self._install_mouse_filters()
+                self._sync_display_activity()
+                self._refresh_cards(force=True)
+                self.repaint()
+                if (self.live_enabled and not self._live_busy
+                        and self.source_state in {"cached", "error"}):
+                    self._request_live_refresh()
+                _LOGGER.info(
+                    "进入调整模式 source=%s source_state=%s surface_active=%s paused=%s",
+                    source, self.source_state, self._surface_active, self._display_paused(),
+                )
+            else:
+                self._save_settings()
+                self.releaseMouse()
+                self._set_locked(True)
+                self._refresh_cards(force=True)
+                self.repaint()
+                self._place_desktop()
+                self._sync_display_activity()
+                _LOGGER.info(
+                    "退出调整模式 source=%s surface_active=%s paused=%s",
+                    source, self._surface_active, self._display_paused(),
+                )
+            return True
+        finally:
+            self._edit_transition = False
 
-    def toggle_hidden(self):
-        if self.hidden:
-            self.hidden = False
-            self.show()
-            self._clamp_to_screens()
-            self._set_locked(True)
-            self._place_desktop()
+    def request_close(self, reason="unknown"):
+        """记录关闭来源后进入统一关闭流程。"""
+        self._close_reason = str(reason or "unknown")[:64]
+        _LOGGER.info("收到关闭请求 reason=%s", self._close_reason)
+        self.close()
+
+    def _show_panel(self, explicit=False):
+        if self._close_requested or (self.hidden and not explicit):
+            return False
+        self.hidden = False
+        was_system_hidden = self._system_hidden
+        self._system_hidden = False
+        without_activation = self.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        try:
+            if self.isMinimized():
+                self.showNormal()
+            else:
+                # 系统可隐藏原生 Tool 窗口，但 Qt 仍认为它可见；重新映射一次。
+                if was_system_hidden and self.isVisible():
+                    self.hide()
+                self.show()
+        finally:
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, without_activation)
+        self._system_hidden = False
+        self._clamp_to_screens()
+        self._sync_display_activity()
+        return True
+
+    def _sync_display_activity(self):
+        if not hasattr(self, "carousel_timer"):
+            return
+        suspended = self._display_paused()
+        changed = self._display_suspended != suspended
+        self._display_suspended = suspended
+        self._sync_carousel_timer()
+        if self._close_requested:
+            self.timer.stop()
+            return
+        if suspended:
+            if self.live_enabled and not self._live_busy:
+                self.timer.start(self._poll_interval())
+            elif not self.live_enabled:
+                self.timer.stop()
+        else:
             if self._view_dirty:
                 self._view_dirty = False
                 self._refresh_cards()
+            if not self.live_enabled:
+                if not self.timer.isActive():
+                    self.timer.start(1800)
+            elif not self._live_busy:
+                if changed and time.monotonic() - self._last_live_success_at >= self.refresh_interval_ms / 1000:
+                    self._request_live_refresh()
+                elif changed or not self.timer.isActive():
+                    self.timer.start(self._poll_interval())
+
+    def toggle_hidden(self):
+        if self._close_requested:
+            return
+        if self.hidden or self.isMinimized() or self._system_hidden or not self.isVisible():
+            self._show_panel(explicit=True)
+            self._set_locked(True)
+            self._place_desktop()
         else:
+            self._disable_desktop_surface(restore_window=False)
             if not self.locked:
                 self._set_locked(True)
             self._save_settings()
             self.hidden = True
             self.hide()
-        self._sync_carousel_timer()
-        if self.live_enabled and not self._live_busy:
-            if not self.hidden and time.monotonic() - self._last_live_success_at >= self.refresh_interval_ms / 1000:
-                self._request_live_refresh()
-            else:
-                self.timer.start(max(60_000, self._next_refresh_ms) if self.hidden else self._next_refresh_ms)
+        self._sync_display_activity()
+
+    def _install_shell_hook(self):
+        if not IS_WINDOWS or self._shell_hook or self._close_requested:
+            return
+        self._taskbar_created_message = int(_user32.RegisterWindowMessageW("TaskbarCreated"))
+
+        def foreground_changed(_hook, _event, hwnd, _object, _child, _thread, _time):
+            # 进程外回调只排队，不在 Windows 回调栈里调整窗口或重新入 Qt。
+            if hwnd and not self._close_requested:
+                self.shell_foreground_changed.emit(int(hwnd))
+
+        self._shell_event_callback = _WinEventProc(foreground_changed)
+        self._shell_hook = _user32.SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None,
+            self._shell_event_callback, 0, 0, WINEVENT_SKIPOWNPROCESS,
+        )
+        if not self._shell_hook:
+            self._shell_event_callback = None
+            _LOGGER.warning("无法注册桌面前台事件：%s", ctypes.get_last_error())
+
+    def _remove_shell_hook(self):
+        if IS_WINDOWS and self._shell_hook:
+            if not _user32.UnhookWinEvent(self._shell_hook):
+                _LOGGER.error("桌面事件解除失败：%s", ctypes.get_last_error())
+                # 原生系统仍可能持有回调；保留至进程结束，避免回调悬空导致崩溃。
+                _SHELL_HOOK_KEEPALIVE.append((self._shell_hook, self._shell_event_callback))
+            self._shell_hook = None
+            self._shell_event_callback = None
+
+    @Slot(object)
+    def _on_shell_foreground(self, hwnd):
+        if IS_WINDOWS and hwnd and not self._close_requested and self.layer_mode == "desktop":
+            if self._surface_active and self._desktop_surface and self._desktop_surface.alive():
+                return
+            # Win+D 返回应用时也要降回桌面层；不能只处理桌面成为前台的一半。
+            self._queue_desktop_recovery()
+
+    def _queue_desktop_recovery(self):
+        if (not hasattr(self, "_desktop_recovery_timer") or self._close_requested
+                or self.hidden or self.editing or self.layer_mode != "desktop"):
+            return
+        self._desktop_recovery_timer.start()
+
+    def _recover_desktop_window(self):
+        if self._close_requested or self.hidden or self.editing or self.layer_mode != "desktop":
+            return
+        if self._show_panel():
+            self._place_desktop()
 
     def _desktop_anchor(self):
         if not IS_WINDOWS:
@@ -4246,9 +4861,8 @@ class ProbeWindow(QWidget):
         shell = _user32.GetShellWindow()
         if not shell:
             # 某些替代桌面、远程会话或定制 Shell 不提供 GetShellWindow。
-            # HWND_BOTTOM 可能落到壁纸合成层下面，导致进程存在但完全不可见；
-            # HWND_TOP 不激活窗口，普通工作窗口获得焦点后仍可自然覆盖它。
-            return HWND_TOP
+            # 不能继续把窗口放到不确定的桌面层，否则进程存在但用户完全看不到。
+            return 0
         pid_shell = wintypes.DWORD()
         _user32.GetWindowThreadProcessId(shell, ctypes.byref(pid_shell))
         found = []
@@ -4261,13 +4875,69 @@ class ProbeWindow(QWidget):
                 return True
             name = ctypes.create_unicode_buffer(128)
             _user32.GetClassNameW(hwnd, name, len(name))
-            if name.value in ("Progman", "WorkerW") and _user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None):
+            if (name.value in ("Progman", "WorkerW") and _user32.IsWindowVisible(hwnd)
+                    and _user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None)):
                 found.append(hwnd)
                 return False
             return True
 
         _user32.EnumWindows(enum_type(locate), 0)
-        return found[0] if found else shell
+        return found[0] if found else 0
+
+    def _queue_surface_render(self):
+        if (getattr(self, "_surface_active", False) and not self._close_requested
+                and not self.hidden and hasattr(self, "_surface_render_timer")):
+            self._surface_render_timer.start()
+
+    def _disable_desktop_surface(self, restore_window):
+        if hasattr(self, "_surface_render_timer"):
+            self._surface_render_timer.stop()
+        had_active_surface = self._surface_active
+        surface, self._desktop_surface = self._desktop_surface, None
+        self._surface_active = False
+        if surface is not None:
+            try:
+                surface.destroy()
+            except OSError:
+                _LOGGER.exception("桌面显示层销毁失败")
+        if IS_WINDOWS and restore_window and not self.hidden:
+            self._surface_transition = True
+            without_activation = self.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+            try:
+                if had_active_surface:
+                    # 控制窗口由原生 ShowWindow 隐藏，Qt 仍认为它可见。
+                    # 经过 Qt 的 hide/show 才能重新同步窗口和子控件的绘制状态。
+                    self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+                    if self.isVisible():
+                        self.hide()
+                    self.show()
+                    _LOGGER.info("桌面层切换：已请求 Qt 重新显示控制窗口")
+                elif self.isVisible():
+                    _user32.ShowWindow(int(self.winId()), 4)  # SW_SHOWNOACTIVATE
+            finally:
+                self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, without_activation)
+                self._surface_transition = False
+
+    def _refresh_desktop_surface(self):
+        if not self._surface_active or self._close_requested or self.hidden or self.editing:
+            return
+        if not self._place_desktop():
+            _LOGGER.warning("桌面面板刷新失败：%s", self._layer_error)
+
+    def _fallback_to_normal_layer(self, hwnd, flags, reason):
+        """本次放置失败时保证窗口可见，保留用户偏好以便下次事件重试。"""
+        if self._preferences_rolling_back:
+            self._layer_error = reason
+            return False
+        message = f"{reason}，本次按普通窗口显示，保留原图层设置"
+        if self._layer_error != message:
+            _LOGGER.warning("图层暂时不可用：%s", message)
+        if not _user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags):
+            self._layer_error = f"{reason}；普通窗口回退失败：{ctypes.get_last_error()}"
+            return False
+        self._layer_error = message
+        self.update()
+        return False
 
     def set_layer_mode(self, mode):
         if mode not in {"desktop", "normal", "topmost"}:
@@ -4278,23 +4948,47 @@ class ProbeWindow(QWidget):
         self._save_settings()
 
     def _place_desktop(self):
-        # 只在启动、显式切换/恢复时调整一次层级；数据刷新和桌面点击不抢层。
-        # 桌面后层仍是顶级窗口，不重挂WorkerW以避免已知不可见/闪烁回归。
-        if IS_WINDOWS and self.isVisible():
+        # 桌面后层激活后，Qt 控制窗口会被故意隐藏；此时仍需允许
+        # DesktopSurface 重新抓取控件图像，否则刷新成功也只能更新内存，
+        # 桌面上的可见位图会继续停留在旧缓存。
+        can_refresh_hidden_surface = self._surface_active and self.layer_mode == "desktop"
+        if IS_WINDOWS and (self.isVisible() or can_refresh_hidden_surface):
             hwnd = int(self.winId())
             flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW
+            if self.layer_mode == "desktop":
+                if self._settings_dialog is not None:
+                    return True
+                try:
+                    host = self._desktop_anchor()
+                    icons = _user32.FindWindowExW(host, None, "SHELLDLL_DefView", None) if host else 0
+                    if self._desktop_surface is None:
+                        self._desktop_surface = DesktopSurface()
+                    self._desktop_surface.update(self, host, icons, self.click_through,
+                                                 round(self.opacity_percent * 255 / 100))
+                    self._surface_active = True
+                    self._surface_transition = True
+                    try:
+                        _user32.ShowWindow(hwnd, 0)  # SW_HIDE；Qt 窗口继续作为数据和快捷键控制器。
+                    finally:
+                        self._surface_transition = False
+                    if _user32.IsWindowVisible(hwnd):
+                        raise RuntimeError("无法隐藏原窗口")
+                    if self._layer_error:
+                        _LOGGER.info("桌面显示层已恢复")
+                    self._layer_error = ""
+                    return True
+                except (OSError, RuntimeError, MemoryError, ValueError):
+                    _LOGGER.exception("桌面显示层创建失败")
+                    self._disable_desktop_surface(restore_window=True)
+                    return self._fallback_to_normal_layer(hwnd, flags, "桌面显示层不可用")
+            self._disable_desktop_surface(restore_window=True)
             target = HWND_TOPMOST if self.layer_mode == "topmost" else HWND_NOTOPMOST
             if not _user32.SetWindowPos(hwnd, target, 0, 0, 0, 0, flags):
-                self._layer_error = f"Windows图层切换失败：{ctypes.get_last_error()}"
-                return False
-            if self.layer_mode == "desktop":
-                anchor = self._desktop_anchor()
-                if anchor and anchor != hwnd:
-                    previous = _user32.GetWindow(anchor, GW_HWNDPREV)
-                    if int(previous or 0) != hwnd:
-                        if not _user32.SetWindowPos(hwnd, previous or HWND_TOP, 0, 0, 0, 0, flags):
-                            self._layer_error = f"Windows桌面后层放置失败：{ctypes.get_last_error()}"
-                            return False
+                return self._fallback_to_normal_layer(
+                    hwnd, flags, f"Windows图层切换失败：{ctypes.get_last_error()}"
+                )
+            if self._layer_error:
+                _LOGGER.info("窗口图层已恢复 mode=%s", self.layer_mode)
             self._layer_error = ""
             self.update()
         return True
@@ -4315,6 +5009,8 @@ class ProbeWindow(QWidget):
         self.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _tick(self):
+        if self._close_requested or self._display_paused():
+            return
         self.phase += 1
         for item in self.samples:
             if item["status"] != "online":
@@ -4518,12 +5214,15 @@ class ProbeWindow(QWidget):
         self._next_refresh_ms = self.refresh_interval_ms
         self._retry_failures = 0
         if self.live_enabled and not self._live_busy:
-            self.timer.start(max(60_000, self._next_refresh_ms) if self.hidden else self._next_refresh_ms)
+            self.timer.start(self._poll_interval())
         self._save_settings()
         self._update_header_labels()
 
     def set_carousel_seconds(self, seconds):
-        seconds = self._number(seconds, MIN_CAROUSEL_SECONDS, MAX_CAROUSEL_SECONDS, 15)
+        seconds = self._number(
+            seconds, MIN_CAROUSEL_SECONDS, MAX_CAROUSEL_SECONDS,
+            self.carousel_interval_ms // 1000,
+        )
         self.carousel_interval_ms = seconds * 1000
         self._sync_carousel_timer()
         self._save_settings()
@@ -4685,10 +5384,12 @@ def _enable_dpi_awareness():
 
 def _acquire_instance_lock():
     """避免重复启动造成多个面板和全局快捷键互相争用。"""
-    lock_path = os.path.join(tempfile.gettempdir(), "KomariDesktop-QtProbe.lock")
+    lock_path = os.path.join(tempfile.gettempdir(), INSTANCE_LOCK_FILENAME)
     lock = QLockFile(lock_path)
     if not lock.tryLock(100):
+        _LOGGER.warning("单实例锁被占用 path=%s", lock_path)
         return None
+    _LOGGER.info("已取得单实例锁 path=%s", lock_path)
     return lock
 
 
@@ -4710,41 +5411,56 @@ def _bring_existing_window_to_front():
     try:
         _user32.EnumWindows(enum_type(locate), 0)
         if not found:
+            _LOGGER.warning("单实例锁被占用，但未找到已有窗口")
             return False
         hwnd = found[0]
         # 已有实例自行恢复隐藏状态/打开设置，不从第二个进程强行改窗口层级。
+        _LOGGER.info("找到已有窗口 hwnd=%s，发送唤醒消息", int(hwnd))
         return bool(_user32.PostMessageW(hwnd, WM_APP_WAKE, 0, 0))
     except (TypeError, ValueError, OSError):
+        _LOGGER.exception("查找已有窗口失败")
         return False
 
 
 def main():
+    _configure_logging()
+    _LOGGER.info("程序启动 version=%s pid=%d", APP_VERSION, os.getpid())
     _enable_dpi_awareness()
     instance_lock = _acquire_instance_lock()
     if instance_lock is None:
         shown = _bring_existing_window_to_front()
+        _LOGGER.info("重复启动流程结束 shown=%s", shown)
         if "--debug" in sys.argv:
             print("KomariDesktop Qt Probe 已经在运行。" + (" 已唤醒现有窗口。" if shown else " 未找到现有窗口。"))
         return 0
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setQuitOnLastWindowClosed(True)
-    window = ProbeWindow()
-    # 设计稿面板约为 440×526 逻辑像素；窗口保留少量透明外边距，
-    # 首次运行/旧版尺寸会在
-    # _restore_geometry 中迁移，用户手动调整后的尺寸不会被覆盖。
-    window.resize(452, 538)
-    window.show()
-    if "--settings" in sys.argv:
-        QTimer.singleShot(250, window.open_settings)
-    # 保持锁对象存活到事件循环退出。
-    app._komari_instance_lock = instance_lock
-    exit_code = app.exec()
-    instance_lock.unlock()
-    return exit_code
+    app = None
+    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName(APP_NAME)
+        app.setQuitOnLastWindowClosed(True)
+        window = ProbeWindow()
+        window.shutdown_ready.connect(app.quit, Qt.ConnectionType.QueuedConnection)
+        # 设计稿面板约为 440×526 逻辑像素；窗口保留少量透明外边距，
+        # 首次运行/旧版尺寸会在
+        # _restore_geometry 中迁移，用户手动调整后的尺寸不会被覆盖。
+        window.resize(452, 538)
+        window.show()
+        if "--settings" in sys.argv:
+            QTimer.singleShot(250, window.open_settings)
+        # 保持锁对象存活到事件循环退出。
+        app._komari_instance_lock = instance_lock
+        _LOGGER.info("进入 Qt 事件循环")
+        exit_code = app.exec()
+        _LOGGER.info("Qt 事件循环结束 exit_code=%s", exit_code)
+        return exit_code
+    except BaseException:
+        _LOGGER.exception("程序主流程异常退出")
+        raise
+    finally:
+        instance_lock.unlock()
+        _LOGGER.info("程序退出 pid=%d", os.getpid())
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 

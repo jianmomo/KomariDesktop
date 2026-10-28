@@ -1,7 +1,7 @@
 param(
     [string]$PythonPath = "python",
     [switch]$SkipInstall,
-    [string]$Version = "1.0.0"
+    [string]$Version = "1.0.3"
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,4 +45,3 @@ Remove-Item -LiteralPath $pyinstallerDist -Recurse -Force
 Write-Host "BUILD_OK $stage"
 Write-Host "ZIP_OK $zipPath"
 Write-Host "SHA256 $hash"
-
